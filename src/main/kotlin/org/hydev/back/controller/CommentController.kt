@@ -44,23 +44,35 @@ class CommentController(
     private val harmClassifier: IHarmClassifier
 ) {
 
+    data class NoteUpdateResult(
+        val message: String,
+        val needsGithubSync: Boolean = false,
+        val commentId: Long? = null
+    )
+
     /**
      * Add or update note for a pending comment
      * @param commentId Comment ID
      * @param noteContent Note content (use "clear" to clear the note)
      * @return Success message or error message
      */
-    fun addNote(commentId: Long, noteContent: String): String {
+    fun addNote(commentId: Long, noteContent: String): NoteUpdateResult {
         val comment = commentRepo.queryById(commentId)
-            ?: return "找不到评论 #$commentId"
+            ?: return NoteUpdateResult("找不到评论 #$commentId")
 
         if (noteContent.lowercase() == "clear") {
             commentRepo.save(comment.apply { note = null })
-            return "✅ 已清空评论 #$commentId 的备注"
+            return if (comment.approved)
+                NoteUpdateResult("✅ 已清空评论 #$commentId 的备注\n此评论已通过审核，可选择同步到 GitHub", needsGithubSync = true, commentId = commentId)
+            else
+                NoteUpdateResult("✅ 已清空评论 #$commentId 的备注")
         }
 
         commentRepo.save(comment.apply { note = noteContent })
-        return "✅ 已为评论 #$commentId 添加备注：\n$noteContent"
+        return if (comment.approved)
+            NoteUpdateResult("✅ 已为评论 #$commentId 添加备注：\n$noteContent\n此评论已通过审核，可选择同步到 GitHub", needsGithubSync = true, commentId = commentId)
+        else
+            NoteUpdateResult("✅ 已为评论 #$commentId 添加备注：\n$noteContent")
     }
 
     private val controllerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -113,10 +125,18 @@ class CommentController(
         "封禁 IP" to "ban"
     )
 
+    private val confirmActionLabels = actionButtons + mapOf(
+        "同步备注到 GitHub" to "sync-note"
+    )
+
     val replyMarkup = InlineKeyboardMarkup.createSingleRowKeyboard(
         actionButtons.map { (text, action) ->
             InlineKeyboardButton.CallbackData(text = text, callbackData = "comment-$action")
         }
+    )
+
+    val noteSyncMarkup = InlineKeyboardMarkup.createSingleRowKeyboard(
+        InlineKeyboardButton.CallbackData(text = "同步备注到 GitHub", callbackData = "comment-sync-note")
     )
 
     val commentCallback: HandleCallbackQuery = callback@ {
@@ -134,6 +154,13 @@ class CommentController(
         if (data == "comment-cancel") {
             withCommentLock(bot, id, callbackQuery.id, chatId, "cancel") {
                 bot.editMessageReplyMarkup(chatId, msgId, inlId, replyMarkup)
+            }
+            return@callback
+        }
+
+        if (data == "comment-cancel-sync-note") {
+            withCommentLock(bot, id, callbackQuery.id, chatId, "cancel-sync-note") {
+                bot.editMessageReplyMarkup(chatId, msgId, inlId, noteSyncMarkup)
             }
             return@callback
         }
@@ -209,16 +236,62 @@ class CommentController(
                         if (statusMsgId != 0L) bot.deleteMessage(chatId, statusMsgId)
                     }
                 }
+
+                // Update note/replies in existing GitHub comment file
+                "sync-note" -> withCommentLock(bot, id, callbackQuery.id, chatId, "sync-note") {
+                    val comment = commentRepo.queryById(id)
+                    if (comment == null) {
+                        bot.sendMessage(chatId, "⚠️ 找不到评论 #$id")
+                        return@withCommentLock
+                    }
+                    if (!comment.approved) {
+                        bot.sendMessage(chatId, "⚠️ 评论 #$id 尚未通过审核，暂不需要同步备注")
+                        return@withCommentLock
+                    }
+
+                    val fPath = findApprovedCommentFilePath(comment.personId, comment.id)
+                    if (fPath == null) {
+                        bot.sendMessage(chatId, "⚠️ 找不到评论 #$id 对应的 GitHub 文件，无法同步备注")
+                        return@withCommentLock
+                    }
+
+                    val content = json(
+                        "id" to comment.id,
+                        "content" to comment.content,
+                        "submitter" to comment.submitter,
+                        "date" to comment.date,
+                        *comment.note?.let {
+                            arrayOf("replies" to listOf(mapOf("content" to it, "submitter" to "Maintainer")))
+                        } ?: arrayOf()
+                    )
+
+                    val url = updateFileDirectly(
+                        editor = operator,
+                        edit = DataEdit(fPath, content),
+                        message = "[~] Update maintainer note for comment #$id"
+                    )
+
+                    bot.editMessageText(
+                        chatId,
+                        msgId,
+                        inlId,
+                        "$message\n- 已同步备注到 GitHub ✅ by $operator",
+                        replyMarkup = InlineKeyboardMarkup.createSingleRowKeyboard(
+                            InlineKeyboardButton.Url(text = "查看 Commit", url = url)
+                        )
+                    )
+                }
             }
             return@callback
         }
 
         val action = data.removePrefix("comment-")
-        val confirmText = actionButtons.entries.find { it.value == action }?.key?.let { "✅ 确认$it" }
+        val confirmText = confirmActionLabels.entries.find { it.value == action }?.key?.let { "✅ 确认$it" }
+        val cancelCallback = if (action == "sync-note") "comment-cancel-sync-note" else "comment-cancel"
         val confirmMarkup = confirmText?.let {
             InlineKeyboardMarkup.createSingleRowKeyboard(
                 InlineKeyboardButton.CallbackData(text = it, callbackData = "comment-confirm-$action"),
-                InlineKeyboardButton.CallbackData(text = "❌ 取消", callbackData = "comment-cancel")
+                InlineKeyboardButton.CallbackData(text = "❌ 取消", callbackData = cancelCallback)
             )
         } ?: replyMarkup
 

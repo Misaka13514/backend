@@ -93,7 +93,16 @@ class PostConstruct(
 					val noteContent = (message.text ?: "").substringAfter("/note").trim()
 						.ifBlank { null } ?: return@secureCmd "Usage: /note <note> or /note clear"
 
-					commentController.addNote(commentId, noteContent)
+					val result = commentController.addNote(commentId, noteContent)
+					if (result.needsGithubSync) {
+						reply(
+							"#${result.commentId} 备注已更新，是否同步到 GitHub？\n${result.message}",
+							replyMarkup = commentController.noteSyncMarkup
+						)
+						null
+					} else {
+						result.message
+					}
 				}
 				callbackQuery("comment-", commentController.commentCallback)
 			}
